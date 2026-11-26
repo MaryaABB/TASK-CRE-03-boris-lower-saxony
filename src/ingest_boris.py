@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import os
@@ -6,6 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import geopandas as gpd
+import pandas as pd
 import requests
 from owslib.wfs import WebFeatureService
 from shapely.geometry import MultiPolygon, Polygon, shape
@@ -20,6 +22,8 @@ logger = logging.getLogger("boris_ingestor")
 
 TARGET_CRS = "EPSG:25832"
 DEFAULT_WFS_URL = "https://opendata.lgln.niedersachsen.de/doorman/noauth/boris_wfs"
+DEFAULT_LAYER = "boris:BR_BodenrichtwertZonal"
+WFS_GML_FORMAT = "application/gml+xml; version=3.2"
 
 
 def extract_polygon_geometry(geom) -> Optional[MultiPolygon]:
@@ -54,9 +58,16 @@ def extract_polygon_geometry(geom) -> Optional[MultiPolygon]:
 
 def parse_valuation_date(props: Dict[str, Any]) -> Optional[str]:
     """Extract and normalize valuation date (YYYY-MM-DD) from BORIS attributes."""
-    for key in ("stichtag", "STICHTAG", "valuation_date", "stag", "STAG"):
+    for key in (
+        "stichtag",
+        "STICHTAG",
+        "valuation_date",
+        "stag",
+        "STAG",
+        "bodenrichtwertStichtag",
+    ):
         val = props.get(key)
-        if val:
+        if val is not None and not pd.isna(val):
             val_str = str(val).strip()[:10]
             try:
                 datetime.strptime(val_str, "%Y-%m-%d")
@@ -75,9 +86,19 @@ def normalize_feature(
         return None, "Empty or non-polygonal geometry"
 
     zone_id = None
-    for key in ("brw_id", "BRW_ID", "wnum", "WNUM", "zone_id", "gml_id", "id"):
-        if props.get(key) is not None and str(props.get(key)).strip():
-            zone_id = str(props.get(key)).strip()
+    for key in (
+        "brw_id",
+        "BRW_ID",
+        "bodenrichtwertnummer",
+        "wnum",
+        "WNUM",
+        "zone_id",
+        "gml_id",
+        "id",
+    ):
+        val = props.get(key)
+        if val is not None and not pd.isna(val) and str(val).strip():
+            zone_id = str(val).strip()
             break
 
     if not zone_id:
@@ -88,34 +109,42 @@ def normalize_feature(
         return None, f"Missing or invalid valuation_date for zone {zone_id}"
 
     land_value = None
-    for key in ("brw", "BRW", "bodenrichtwert", "land_value_eur_m2"):
-        if props.get(key) is not None:
+    for key in ("brw", "BRW", "bodenrichtwert", "wert", "land_value_eur_m2"):
+        val = props.get(key)
+        if val is not None and not pd.isna(val):
             try:
-                land_value = float(str(props[key]).replace(",", "."))
+                land_value = float(str(val).replace(",", "."))
                 break
             except ValueError:
                 pass
 
-    land_use = (
-        props.get("nutzungsart")
-        or props.get("NUTZUNGSART")
-        or props.get("nutz")
-        or props.get("land_use_type")
-    )
-    municipality = (
-        props.get("gemeinde")
-        or props.get("GEMEINDE")
-        or props.get("gena")
-        or props.get("municipality")
-    )
+    land_use = None
+    for key in (
+        "nutzungsart",
+        "NUTZUNGSART",
+        "art", "artDerNutzung",
+        "nutz",
+        "land_use_type",
+    ):
+        val = props.get(key)
+        if val is not None and not pd.isna(val) and str(val).strip():
+            land_use = str(val).strip()
+            break
+
+    municipality = None
+    for key in ("name", "gemeindename", "gemeinde", "GEMEINDE", "gena", "municipality"):
+        val = props.get(key)
+        if val is not None and not pd.isna(val) and str(val).strip():
+            municipality = str(val).strip()
+            break
 
     record = {
         "zone_id": zone_id,
         "state_code": "NI",
         "valuation_date": valuation_date,
         "land_value_eur_m2": land_value,
-        "land_use_type": str(land_use) if land_use is not None else None,
-        "municipality": str(municipality) if municipality is not None else None,
+        "land_use_type": land_use,
+        "municipality": municipality,
         "geom_wkt": valid_geom.wkt,
         "source_name": "LGLN_BORIS_WFS",
         "source_url": source_url,
@@ -140,44 +169,85 @@ def load_from_fixture(fixture_path: str) -> gpd.GeoDataFrame:
     return gdf
 
 
-def fetch_from_wfs(wfs_url: str, max_features: int = 500, timeout: int = 30) -> gpd.GeoDataFrame:
-    """Fetch BORIS zones from LGLN WFS with paging and CRS verification."""
+def fetch_from_wfs(
+    wfs_url: str,
+    layer_name: str = DEFAULT_LAYER,
+    page_size: int = 500,
+    max_features: int = 500,
+    timeout: int = 60,
+) -> gpd.GeoDataFrame:
+    """Fetch BORIS zonal land-value polygons from LGLN WFS (GML 3.2) with paging."""
     logger.info("Connecting to LGLN WFS endpoint: %s", wfs_url)
     wfs = WebFeatureService(url=wfs_url, version="2.0.0", timeout=timeout)
-    layers = list(wfs.contents.keys())
-    if not layers:
+    available_layers = list(wfs.contents.keys())
+    if not available_layers:
         raise RuntimeError("No WFS layers advertised by LGLN endpoint.")
 
-    layer_name = layers[0]
-    logger.info("Discovered WFS layer: %s (total available: %d)", layer_name, len(layers))
+    if layer_name not in available_layers:
+        raise ValueError(
+            f"Requested layer '{layer_name}' not found. Available: {available_layers}"
+        )
 
-    params = {
-        "service": "WFS",
-        "version": "2.0.0",
-        "request": "GetFeature",
-        "typeNames": layer_name,
-        "outputFormat": "application/json",
-        "srsName": TARGET_CRS,
-        "count": max_features,
-        "startIndex": 0,
-    }
-    resp = requests.get(wfs_url, params=params, timeout=timeout)
-    resp.raise_for_status()
-    geojson = resp.json()
+    logger.info(
+        "Using WFS layer: %s (page_size=%d, max_features=%d)",
+        layer_name,
+        page_size,
+        max_features,
+    )
 
-    rows = []
-    for feat in geojson.get("features", []):
-        geom = shape(feat["geometry"]) if feat.get("geometry") else None
-        rows.append({"properties": feat.get("properties", {}), "geometry": geom})
+    rows: List[Dict[str, Any]] = []
+    start_index = 0
 
-    gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs=TARGET_CRS)
-    if gdf.crs is None:
-        gdf = gdf.set_crs(TARGET_CRS)
-    elif gdf.crs.to_string() != TARGET_CRS:
-        logger.info("Reprojecting from %s to %s", gdf.crs.to_string(), TARGET_CRS)
-        gdf = gdf.to_crs(TARGET_CRS)
+    while True:
+        if max_features > 0:
+            remaining = max_features - len(rows)
+            if remaining <= 0:
+                break
+            count = min(page_size, remaining)
+        else:
+            count = page_size
 
-    return gdf
+        params = {
+            "service": "WFS",
+            "version": "2.0.0",
+            "request": "GetFeature",
+            "typeNames": layer_name,
+            "outputFormat": WFS_GML_FORMAT,
+            "srsName": TARGET_CRS,
+            "count": count,
+            "startIndex": start_index,
+        }
+        logger.info("Fetching WFS page: startIndex=%d, count=%d", start_index, count)
+        resp = requests.get(wfs_url, params=params, timeout=timeout)
+        resp.raise_for_status()
+
+        page_gdf = gpd.read_file(io.BytesIO(resp.content))
+        if page_gdf.empty:
+            logger.info("Reached end of WFS features at startIndex=%d", start_index)
+            break
+
+        if page_gdf.crs is None:
+            page_gdf = page_gdf.set_crs(TARGET_CRS)
+        elif page_gdf.crs.to_string() != TARGET_CRS:
+            logger.info("Reprojecting from %s to %s", page_gdf.crs.to_string(), TARGET_CRS)
+            page_gdf = page_gdf.to_crs(TARGET_CRS)
+
+        geom_col = page_gdf.geometry.name
+        prop_cols = [c for c in page_gdf.columns if c != geom_col]
+
+        for _, feat_row in page_gdf.iterrows():
+            props = {
+                col: (None if pd.isna(feat_row[col]) else feat_row[col])
+                for col in prop_cols
+            }
+            rows.append({"properties": props, "geometry": feat_row[geom_col]})
+
+        fetched_count = len(page_gdf)
+        start_index += fetched_count
+        if fetched_count < count:
+            break
+
+    return gpd.GeoDataFrame(rows, geometry="geometry", crs=TARGET_CRS)
 
 
 def upsert_records(db_uri: str, records: List[Dict[str, Any]]) -> int:
@@ -225,13 +295,21 @@ def run_pipeline() -> Dict[str, int]:
 
     use_fixture = os.environ.get("USE_FIXTURE", "false").lower() == "true"
     wfs_url = os.environ.get("BORIS_WFS_URL", DEFAULT_WFS_URL)
+    layer_name = os.environ.get("BORIS_LAYER", DEFAULT_LAYER)
+    page_size = int(os.environ.get("WFS_PAGE_SIZE", "500"))
+    max_features = int(os.environ.get("MAX_FEATURES", "500"))
     fixture_path = os.environ.get("FIXTURE_PATH", "tests/fixture_boris.json")
 
     if use_fixture:
         gdf = load_from_fixture(fixture_path)
         source_url = f"fixture://{fixture_path}"
     else:
-        gdf = fetch_from_wfs(wfs_url)
+        gdf = fetch_from_wfs(
+            wfs_url=wfs_url,
+            layer_name=layer_name,
+            page_size=page_size,
+            max_features=max_features,
+        )
         source_url = wfs_url
 
     processed = 0
