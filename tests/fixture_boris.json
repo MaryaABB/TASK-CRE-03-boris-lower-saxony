@@ -1,0 +1,48 @@
+{
+  "type": "FeatureCollection",
+  "crs": {
+    "type": "name",
+    "properties": { "name": "EPSG:25832" }
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "brw_id": "NI-03241001-0001",
+        "stichtag": "2025-01-01",
+        "brw": 450.0,
+        "nutzungsart": "Gewerbegebiet (G)",
+        "gemeinde": "Hannover"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[548000.0, 5802000.0], [548100.0, 5802000.0], [548100.0, 5802100.0], [548000.0, 5802100.0], [548000.0, 5802000.0]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "brw_id": "NI-03241001-0002",
+        "stichtag": "2025-01-01",
+        "brw": 320.5,
+        "nutzungsart": "Mischgebiet (M)",
+        "gemeinde": "Braunschweig"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[604000.0, 5792000.0], [604100.0, 5792100.0], [604100.0, 5792000.0], [604000.0, 5792100.0], [604000.0, 5792000.0]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "brw_id": "NI-03241001-INVALID",
+        "stichtag": "2025-01-01",
+        "brw": 100.0,
+        "nutzungsart": "Wohnbaufläche (W)",
+        "gemeinde": "Osnabrück"
+      },
+      "geometry": null
+    }
+  ]
+}
